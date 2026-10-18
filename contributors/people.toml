@@ -138,6 +138,8 @@ display_name = "Andrej Škvorc"
 sync_github_name = false
 
 [people.HankTheMan2828]
+sync_github_name = true
+
 [people.olekkut]
 real_name = "Aleksander Kutycki"
 display_name = "Aleksander Kutycki"
