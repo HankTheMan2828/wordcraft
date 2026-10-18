@@ -427,6 +427,8 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
         });
 }
 
+/// The status bar under the page: page x of y, the word count, the caret's language and, on the
+/// right, the view buttons, Focus and the zoom slider with its readout.
 pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Panel::bottom("status")
