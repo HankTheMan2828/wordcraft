@@ -4535,6 +4535,40 @@ fn page_and_table_gridlines_toggle_independently() {
     assert_eq!(state["tableGridlines"], false);
 }
 
+#[test]
+fn focus_and_full_screen_replace_each_other() {
+    // #1678: Focus and Full Screen View are separate screen states; one on turns the other off.
+    // Both are registry commands, so Customize Keyboard can bind them.
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "Hello"}));
+    let undo = s.undo_labels();
+    assert!(s.registry.get("view.fullScreenView").is_some() && s.registry.get("view.focus").is_some());
+
+    assert_eq!(run(&mut s, "view.focus", json!({}))["value"], true);
+    assert!(s.view.focus_mode && !s.view.full_screen_view);
+    assert_eq!(run(&mut s, "view.fullScreenView", json!({}))["value"], true);
+    assert!(s.view.full_screen_view && !s.view.focus_mode);
+    assert_eq!(run(&mut s, "view.focus", json!({"value": true}))["value"], true);
+    assert!(s.view.focus_mode && !s.view.full_screen_view);
+    assert_eq!(run(&mut s, "view.focus", json!({}))["value"], false);
+    assert!(!s.view.focus_mode && !s.view.full_screen_view);
+    assert_eq!(run(&mut s, "view.fullScreenView", json!({"value": false}))["value"], false);
+    assert!(!s.view.full_screen_view);
+    // Full Screen (#980) is the window alone: it leaves Focus be.
+    run(&mut s, "view.focus", json!({"value": true}));
+    run(&mut s, "view.fullScreen", json!({"value": true}));
+    assert!(s.view.focus_mode && s.view.full_screen);
+    run(&mut s, "view.focus", json!({"value": false}));
+    run(&mut s, "view.fullScreen", json!({"value": false}));
+
+    // Immersive Reader is a reading view, not Focus.
+    run(&mut s, "view.immersive", json!({}));
+    assert!(s.view.read_mode && !s.view.focus_mode);
+
+    assert_eq!(text(&s), "Hello");
+    assert_eq!(s.undo_labels(), undo);
+}
+
 /// Issue #768: zooming by percent after One Page or Page Width keeps one page per row.
 #[test]
 fn zoom_after_one_page_keeps_single_column() {
@@ -5546,6 +5580,51 @@ fn documents_open_by_content_when_the_extension_is_wrong() {
     // Matching content still goes the usual way, and garbage stays an error.
     assert!(text(&crate::io::open_bytes("plain.rtf", rtf).unwrap()).contains("Invoice line"));
     assert!(crate::io::open_bytes("broken.doc", b"\x00\x01not a document").is_err());
+}
+
+/// #2853: a Word XML Document (Word 2003 XML or Flat OPC) or a web page saved under a `.doc`
+/// name opens by what it holds, as in Word; it went to the Word 97-2003 reader, which refused it,
+/// and the window showed a blank page.
+#[test]
+fn word_xml_and_web_pages_saved_as_doc_open_by_content() {
+    let text = |doc: &wordcraft_doc::Document| doc.plain_text(StoryRef::Body);
+    let mut s = Session::new(wordcraft_doc::Document::new());
+    run(&mut s, "text.insert", json!({"text": "Truyện ngắn, chương một"}));
+    run(&mut s, "format.bold", json!({}));
+    let word2003 = crate::io::ExportOptions { word2003: true, ..Default::default() };
+    let xml2003 = crate::io::save_bytes_opts("a.xml", &s.doc, &word2003).unwrap();
+    let flat = crate::io::save_bytes("a.xml", &s.doc).unwrap();
+    assert!(xml2003.windows(14).any(|w| w == b"w:wordDocument") && flat.windows(11).any(|w| w == b"pkg:package"));
+    for (what, bytes) in [("Word 2003 XML", &xml2003), ("Flat OPC", &flat)] {
+        for name in ["soulsoul.txt.doc", "Story.DOC", "story.dot", "story.docx", "story.rtf"] {
+            let doc = crate::io::open_bytes(name, bytes).unwrap_or_else(|e| panic!("{what} as {name}: {e}"));
+            assert!(text(&doc).contains("Truyện ngắn, chương một"), "{what} as {name}: {:?}", text(&doc));
+        }
+    }
+    // With a byte-order mark and blank lines before the declaration.
+    let bom = [&[0xEF, 0xBB, 0xBF][..], b"\r\n  ", &xml2003].concat();
+    assert!(text(&crate::io::open_bytes("bom.doc", &bom).unwrap()).contains("chương một"));
+
+    // Web pages: Word's Save as Web Page, and a report generator's HTML under a `.doc` name.
+    let pages: [&str; 3] = [
+        "<html xmlns:o=\"urn:schemas-microsoft-com:office:office\" xmlns:w=\"urn:schemas-microsoft-com:office:word\">\r\n<head><meta charset=utf-8></head>\r\n<body lang=VI><p class=MsoNormal><b>Báo cáo</b> tháng 9</p></body></html>",
+        "\u{FEFF}<!DOCTYPE html>\n<!-- generated -->\n<html><body><h1>Báo cáo</h1><p>tháng 9</p></body></html>",
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!DOCTYPE HTML PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"x\"><HTML><BODY><P>Báo cáo tháng 9</P></BODY></HTML>",
+    ];
+    for (i, page) in pages.iter().enumerate() {
+        for name in ["report.doc", "report.docx", "report.rtf"] {
+            let doc = crate::io::open_bytes(name, page.as_bytes()).unwrap_or_else(|e| panic!("page {i} as {name}: {e}"));
+            let t = text(&doc);
+            assert!(t.contains("Báo cáo") && t.contains("tháng 9") && !t.contains('<'), "page {i} as {name}: {t:?}");
+        }
+    }
+    // A web page in an unknown extension is still plain text, other XML still no Word document.
+    assert!(text(&crate::io::open_bytes("page.log", pages[1].as_bytes()).unwrap()).contains("<html>"));
+    assert!(crate::io::open_bytes("note.doc", b"<?xml version=\"1.0\"?><note>hi</note>").is_err());
+    // Nor is XML whose root only starts like `html`.
+    for xml in [&b"<htmlish>text</htmlish>"[..], b"<!DOCTYPE htmlish><htmlish>text</htmlish>"] {
+        assert!(crate::io::open_bytes("other.doc", xml).is_err(), "{:?}", String::from_utf8_lossy(xml));
+    }
 }
 
 /// #569: a playlist (.m3u / .m3u8) — or any file with an extension WordCraft doesn't know —
@@ -8044,6 +8123,92 @@ fn exported_page_images_draw_headers_at_full_strength() {
     let darkest = (0..top).flat_map(|y| (0..img.width()).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y)[0]).min().unwrap();
     assert!(darkest < 60, "header drawn dimmed: darkest pixel {darkest}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shape Format › Shape Fill with transparency and gradients (#1500): each form sets the fill of
+/// every selected shape in one undo step; a colour alone keeps the transparency; hostile values
+/// are clamped; the old `{"color"}` form still works.
+#[test]
+fn shape_fill_transparency_and_gradients() {
+    use wordcraft_doc::fill::{Fill, GradientKind, PathShape};
+    use wordcraft_doc::props::Rgb;
+    let mut s = s();
+    run(&mut s, "insert.shape", json!({"kind": "rectangle"}));
+    run(&mut s, "select.collapse", json!({"end": true}));
+    run(&mut s, "insert.shape", json!({"kind": "ellipse"}));
+    run(&mut s, "select.objects", json!({"index": 0}));
+    run(&mut s, "select.addObject", json!({"index": 1}));
+    let fills = |s: &Session| -> Vec<Option<Fill>> {
+        cmd::objects::all_objects(s)
+            .into_iter()
+            .map(|(_, o)| match o {
+                wordcraft_doc::InlineObject::Shape { fill, .. } => fill,
+                o => panic!("{o:?}"),
+            })
+            .collect()
+    };
+    let before = fills(&s);
+    run(&mut s, "shape.fill", json!({"color": "112233", "transparency": 40}));
+    let solid = Fill::Solid { color: Rgb(0x11, 0x22, 0x33), transparency: 40.0 };
+    assert_eq!(fills(&s), [Some(solid.clone()), Some(solid)], "both selected shapes");
+    run(&mut s, "shape.fill", json!({"color": "445566"}));
+    assert_eq!(fills(&s)[1], Some(Fill::Solid { color: Rgb(0x44, 0x55, 0x66), transparency: 40.0 }), "a colour alone keeps the transparency");
+    run(
+        &mut s,
+        "shape.fill",
+        json!({"gradient": {"type": "rectangular", "focus": [50, 50, 50, 50], "stops": [{"pos": 100, "color": "FFFFFF", "transparency": 30}, {"pos": 0, "color": "000000"}]}}),
+    );
+    let Some(Fill::Gradient(g)) = &fills(&s)[0] else { panic!("{:?}", fills(&s)) };
+    assert_eq!(g.kind, GradientKind::Path { shape: PathShape::Rect, focus: [50.0; 4] });
+    assert_eq!(g.stops.iter().map(|st| (st.pos, st.color, st.transparency)).collect::<Vec<_>>(), [(0.0, Rgb::BLACK, 0.0), (100.0, Rgb::WHITE, 30.0)]);
+    assert!(g.rot_with_shape, "turns with the shape, as Word's new gradients do");
+    run(
+        &mut s,
+        "shape.fill",
+        json!({"gradient": {"type": "linear", "angle": -90, "stops": [{"pos": -5, "color": "FF0000", "transparency": 500}, {"pos": 1e9, "color": "0000FF"}]}}),
+    );
+    let Some(Fill::Gradient(g)) = &fills(&s)[1] else { panic!() };
+    assert_eq!(g.kind, GradientKind::Linear { angle: 270.0, scaled: false });
+    assert_eq!((g.stops[0].pos, g.stops[0].transparency, g.stops[1].pos), (0.0, 100.0, 100.0));
+    // One undo step per command, for every shape.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(matches!(fills(&s)[1], Some(Fill::Gradient(_))));
+    for _ in 0..3 {
+        run(&mut s, "edit.undo", json!({}));
+    }
+    assert_eq!(fills(&s), before);
+    run(&mut s, "shape.fill", json!({"color": null}));
+    assert_eq!(fills(&s), [None, None]);
+    for bad in [
+        json!({"gradient": {"stops": []}}),
+        json!({"gradient": {"type": "spiral", "stops": [{"pos": 0, "color": "000000"}, {"pos": 100, "color": "FFFFFF"}]}}),
+        json!({"gradient": 5}),
+        json!({"color": "nope"}),
+    ] {
+        assert!(s.run("shape.fill", &bad).is_err(), "{bad}");
+    }
+}
+
+/// A drag in the Format Shape pane applies its value as it goes and undoes in one step.
+#[test]
+fn steps_since_a_mark_merge_into_one_undo_step() {
+    let mut s = s();
+    run(&mut s, "insert.shape", json!({"kind": "rectangle"}));
+    let fill = |s: &Session| match cmd::objects::selected(s) {
+        Some((_, wordcraft_doc::InlineObject::Shape { fill, .. })) => fill,
+        o => panic!("{o:?}"),
+    };
+    let before = fill(&s);
+    let mark = s.undo_mark();
+    for t in [10, 20, 30] {
+        run(&mut s, "shape.fill", json!({"color": "112233", "transparency": t}));
+    }
+    s.merge_undo_since(mark);
+    assert_eq!(s.undo_mark(), mark + 1);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(fill(&s), before);
+    s.merge_undo_since(mark + 5);
+    assert_eq!(s.undo_mark(), mark, "nothing newer: nothing merged");
 }
 
 /// Text typed right after a footnote or endnote number is plain body text, not another raised number.
